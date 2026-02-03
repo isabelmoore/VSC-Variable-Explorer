@@ -1,6 +1,7 @@
 // src/pythonManager.js
 const vscode = require('vscode');
 const path = require('path');
+const fs = require('fs');
 const { spawn } = require('child_process');
 
 class PythonManager {
@@ -49,6 +50,31 @@ class PythonManager {
             }
             return workspaceFolder ? path.join(workspaceFolder, p) : p;
         });
+
+        // Add all subdirectories of workspace to PYTHONPATH (recursive)
+        if (workspaceFolder) {
+            try {
+                const addSubdirs = (dir, depth = 0) => {
+                    if (depth > 5) return; // Limit depth to avoid going too deep
+                    const entries = fs.readdirSync(dir, { withFileTypes: true });
+                    for (const entry of entries) {
+                        if (entry.isDirectory() && 
+                            !entry.name.startsWith('.') && 
+                            !entry.name.startsWith('__') &&
+                            entry.name !== 'node_modules' &&
+                            entry.name !== 'venv' &&
+                            entry.name !== '.git') {
+                            const subdir = path.join(dir, entry.name);
+                            resolvedPaths.push(subdir);
+                            addSubdirs(subdir, depth + 1); // Recurse into subdirectory
+                        }
+                    }
+                };
+                addSubdirs(workspaceFolder);
+            } catch (e) {
+                console.error('Error reading workspace subdirectories:', e);
+            }
+        }
 
         const pythonPathParts = [...resolvedPaths, extensionPythonPath];
         if (process.env.PYTHONPATH) {
