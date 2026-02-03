@@ -1,252 +1,88 @@
-// src/pythonManager.js
-const vscode = require('vscode');
-const path = require('path');
-const fs = require('fs');
-const { spawn } = require('child_process');
+start(onMessage) {
+    this.messageCallback = onMessage;
 
-class PythonManager {
-    constructor(context) {
-        this.context = context;
-        this.process = null;
-        this.messageCallback = null;
-        this.outputBuffer = ''; // Buffer for accumulating stdout data
+    if (this.process) {
+        console.log('Python process already running');
+        return;
+    }
+    this.outputBuffer = '';
+
+    // Get Python path with better fallback logic
+    let pythonPath = vscode.workspace.getConfiguration('python').get('defaultInterpreterPath');
+    if (!pythonPath) {
+        pythonPath = vscode.workspace.getConfiguration('variableExplorer').get('pythonPath');
+    }
+    if (!pythonPath) {
+        pythonPath = process.platform === 'win32' ? 'python' : 'python3';
     }
 
-    start(onMessage) {
-        // Always update the message callback, even if process is already running
-        // This allows the new panel to receive messages after the old panel is disposed
-        this.messageCallback = onMessage;
+    // === DEBUG LOGGING ===
+    console.log('========== VARIABLE EXPLORER DEBUG ==========');
+    console.log('Python path:', pythonPath);
 
-        if (this.process) {
-            console.log('Python process already running');
-            return;
+    const backendScript = path.join(this.context.extensionPath, 'python', 'variable_inspector.py');
+    const workspaceFolder = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
+    
+    console.log('Backend script:', backendScript);
+    console.log('Workspace folder:', workspaceFolder);
+
+    const extraPaths = vscode.workspace.getConfiguration('python').get('analysis.extraPaths') || [];
+    const extensionPythonPath = path.join(this.context.extensionPath, 'python');
+
+    const resolvedPaths = extraPaths.map(p => {
+        if (path.isAbsolute(p)) {
+            return p;
         }
-        this.outputBuffer = ''; // Reset buffer
+        return workspaceFolder ? path.join(workspaceFolder, p) : p;
+    });
 
-        // Get Python path with better fallback logic for macOS
-        let pythonPath = vscode.workspace.getConfiguration('python').get('defaultInterpreterPath');
-        if (!pythonPath) {
-            // Try variableExplorer.pythonPath setting
-            pythonPath = vscode.workspace.getConfiguration('variableExplorer').get('pythonPath');
-        }
-        if (!pythonPath) {
-            // Use python3 on macOS/Linux, python on Windows
-            pythonPath = process.platform === 'win32' ? 'python' : 'python3';
-        }
-
-        const backendScript = path.join(this.context.extensionPath, 'python', 'variable_inspector.py');
-
-        // Get the workspace folder as the working directory
-        const workspaceFolder = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
-
-        // Build PYTHONPATH from python.analysis.extraPaths and extension path
-        const extraPaths = vscode.workspace.getConfiguration('python').get('analysis.extraPaths') || [];
-        const extensionPythonPath = path.join(this.context.extensionPath, 'python');
-
-        // Resolve relative paths against workspace folder
-        const resolvedPaths = extraPaths.map(p => {
-            if (path.isAbsolute(p)) {
-                return p;
-            }
-            return workspaceFolder ? path.join(workspaceFolder, p) : p;
-        });
-
-        // Add all subdirectories of workspace to PYTHONPATH (recursive)
-        if (workspaceFolder) {
-            try {
-                const addSubdirs = (dir, depth = 0) => {
-                    if (depth > 5) return; // Limit depth to avoid going too deep
-                    const entries = fs.readdirSync(dir, { withFileTypes: true });
-                    for (const entry of entries) {
-                        if (entry.isDirectory() && 
-                            !entry.name.startsWith('.') && 
-                            !entry.name.startsWith('__') &&
-                            entry.name !== 'node_modules' &&
-                            entry.name !== 'venv' &&
-                            entry.name !== '.git') {
-                            const subdir = path.join(dir, entry.name);
-                            resolvedPaths.push(subdir);
-                            addSubdirs(subdir, depth + 1); // Recurse into subdirectory
-                        }
-                    }
-                };
-                addSubdirs(workspaceFolder);
-            } catch (e) {
-                console.error('Error reading workspace subdirectories:', e);
-            }
-        }
-
-        const pythonPathParts = [...resolvedPaths, extensionPythonPath];
-        if (process.env.PYTHONPATH) {
-            pythonPathParts.push(process.env.PYTHONPATH);
-        }
-        const pythonPathEnv = pythonPathParts.join(path.delimiter);
-
-        const spawnOptions = {
-            cwd: workspaceFolder || undefined,
-            env: { ...process.env, PYTHONPATH: pythonPathEnv }
-        };
-
-        console.log(`Starting Python backend with: ${pythonPath} ${backendScript}`);
-
+    // Add all subdirectories of workspace to PYTHONPATH (recursive)
+    if (workspaceFolder) {
         try {
-            this.process = spawn(pythonPath, [backendScript], spawnOptions);
-        } catch (e) {
-            console.error('Failed to spawn Python process:', e);
-            vscode.window.showErrorMessage(
-                `Variable Explorer: Failed to start Python backend. ` +
-                `Make sure Python is installed and accessible as "${pythonPath}". ` +
-                `You can configure the Python path in settings.`
-            );
-            return;
-        }
-
-        // Handle spawn errors (e.g., command not found)
-        this.process.on('error', (err) => {
-            console.error('Python process error:', err);
-            this.process = null;
-            vscode.window.showErrorMessage(
-                `Variable Explorer: Failed to start Python. Error: ${err.message}. ` +
-                `Please check that Python is installed and the path is correct in settings.`
-            );
-        });
-
-        this.process.stdout.on('data', (data) => {
-            // Accumulate data in buffer
-            this.outputBuffer += data.toString();
-
-            // Process complete lines (ending with \n)
-            let lineEnd;
-            while ((lineEnd = this.outputBuffer.indexOf('\n')) !== -1) {
-                const line = this.outputBuffer.substring(0, lineEnd).trim();
-                this.outputBuffer = this.outputBuffer.substring(lineEnd + 1);
-
-                if (line.length > 0) {
-                    try {
-                        const response = JSON.parse(line);
-                        if (this.messageCallback) {
-                            this.messageCallback(response);
-                        }
-                    } catch (e) {
-                        console.error('Error parsing Python output:', e, {
-                            line: line.substring(0, 100) + '...',
-                            length: line.length
-                        });
+            const startTime = Date.now();
+            let dirCount = 0;
+            
+            const addSubdirs = (dir, depth = 0) => {
+                if (depth > 5) return;
+                const entries = fs.readdirSync(dir, { withFileTypes: true });
+                for (const entry of entries) {
+                    if (entry.isDirectory() && 
+                        !entry.name.startsWith('.') && 
+                        !entry.name.startsWith('__') &&
+                        entry.name !== 'node_modules' &&
+                        entry.name !== 'venv' &&
+                        entry.name !== '.git') {
+                        const subdir = path.join(dir, entry.name);
+                        resolvedPaths.push(subdir);
+                        dirCount++;
+                        addSubdirs(subdir, depth + 1);
                     }
                 }
-            }
-        });
-
-        this.process.stderr.on('data', (data) => {
-            const errorMsg = data.toString();
-            console.error(`Python Error: ${errorMsg}`);
-            // Show critical errors to user (but not regular warnings)
-            if (errorMsg.includes('ModuleNotFoundError') ||
-                errorMsg.includes('ImportError') ||
-                errorMsg.includes('SyntaxError') ||
-                errorMsg.includes('No module named')) {
-                vscode.window.showErrorMessage(`Variable Explorer Python Error: ${errorMsg.substring(0, 200)}`);
-            }
-        });
-
-        this.process.on('close', (code) => {
-            console.log(`Python process exited with code ${code}`);
-            if (code !== 0 && code !== null) {
-                vscode.window.showWarningMessage(
-                    `Variable Explorer: Python backend exited unexpectedly (code ${code}). ` +
-                    `Try running a Python file again to restart it.`
-                );
-            }
-            this.process = null;
-            this.outputBuffer = ''; // Clear buffer on close
-        });
-    }
-
-    sendCommand(command) {
-        if (!this.process || !this.process.stdin) {
-            console.error('Python backend not running, cannot send command:', command.command);
-            // Return false silently - caller should check isRunning() before calling
-            return false;
-        }
-
-        try {
-            const commandStr = JSON.stringify(command);
-            this.process.stdin.write(commandStr + '\n');
-            return true;
+            };
+            addSubdirs(workspaceFolder);
+            
+            console.log(`Scanned ${dirCount} directories in ${Date.now() - startTime}ms`);
         } catch (e) {
-            console.error('Error sending command to Python:', e);
-            vscode.window.showErrorMessage('Failed to communicate with Python backend. Please try restarting Variable Explorer.');
-            return false;
+            console.error('Error reading workspace subdirectories:', e);
         }
     }
 
-    runFile(filePath) {
-        const captureMainLocals = vscode.workspace.getConfiguration('variableExplorer').get('captureMainLocals', false);
-        return this.sendCommand({
-            command: 'run_file',
-            file: filePath,
-            capture_main_locals: captureMainLocals
-        });
+    const pythonPathParts = [...resolvedPaths, extensionPythonPath];
+    if (process.env.PYTHONPATH) {
+        pythonPathParts.push(process.env.PYTHONPATH);
     }
+    const pythonPathEnv = pythonPathParts.join(path.delimiter);
 
-    runCode(code) {
-        const captureMainLocals = vscode.workspace.getConfiguration('variableExplorer').get('captureMainLocals', false);
-        return this.sendCommand({
-            command: 'run_code',
-            code: code,
-            capture_main_locals: captureMainLocals
-        });
-    }
+    console.log('PYTHONPATH entries:');
+    pythonPathParts.forEach((p, i) => console.log(`  ${i}: ${p}`));
+    console.log('==============================================');
+    
+    // Also show a VS Code notification
+    vscode.window.showInformationMessage(`Variable Explorer: Using Python at ${pythonPath}`);
 
-    getVariables() {
-        return this.sendCommand({ command: 'get_variables' });
-    }
+    const spawnOptions = {
+        cwd: workspaceFolder || undefined,
+        env: { ...process.env, PYTHONPATH: pythonPathEnv }
+    };
 
-    getDetails(varName, path = null) {
-        const command = { command: 'get_details', name: varName };
-        if (path) {
-            command.path = path;
-        }
-        return this.sendCommand(command);
-    }
-
-    updateVariable(varName, varType, newValue) {
-        return this.sendCommand({
-            command: 'update_variable',
-            name: varName,
-            type: varType,
-            value: newValue
-        });
-    }
-
-    clearNamespace() {
-        return this.sendCommand({ command: 'clear_namespace' });
-    }
-
-    saveSession(filePath) {
-        return this.sendCommand({
-            command: 'save_session',
-            file: filePath
-        });
-    }
-
-    loadSession(filePath) {
-        return this.sendCommand({
-            command: 'load_session',
-            file: filePath
-        });
-    }
-
-    isRunning() {
-        return this.process !== null;
-    }
-
-    dispose() {
-        if (this.process) {
-            this.process.kill();
-            this.process = null;
-        }
-    }
-}
-
-module.exports = { PythonManager };
+    // ... rest of the function stays the same
